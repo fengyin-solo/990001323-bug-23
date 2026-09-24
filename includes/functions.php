@@ -78,6 +78,14 @@ function cleanInput($str) {
 }
 
 /**
+ * 转义 LIKE 查询中的特殊字符（%、_、\）
+ * 使关键词按普通文本匹配，避免通配符导致结果偏差
+ */
+function escapeLike($str) {
+    return str_replace(['\\', '%', '_'], ['\\\\', '\\%', '\\_'], $str);
+}
+
+/**
  * 获取访客唯一标识
  * 基于session和cookie实现匿名用户标识
  */

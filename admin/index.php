@@ -16,7 +16,6 @@ $type = $_GET['type'] ?? '';
 $keyword = trim($_GET['keyword'] ?? '');
 $page = max(1, intval($_GET['page'] ?? 1));
 $pageSize = 15;
-$offset = ($page - 1) * $pageSize;
 
 $where = "WHERE 1=1";
 $params = [];
@@ -29,18 +28,36 @@ if ($type && in_array($type, ['help', 'suggest', 'lost'])) {
     $where .= " AND type = ?";
     $params[] = $type;
 }
-if ($keyword) {
+if ($keyword !== '') {
+    // 转义 %、_ 等特殊字符，按普通文本匹配
     $where .= " AND (title LIKE ? OR content LIKE ? OR nickname LIKE ?)";
-    $kw = "%$keyword%";
+    $kw = '%' . escapeLike($keyword) . '%';
     $params[] = $kw;
     $params[] = $kw;
     $params[] = $kw;
 }
+$hasFilter = !empty($params);
 
 $countStmt = $db->prepare("SELECT COUNT(*) FROM messages $where");
 $countStmt->execute($params);
-$total = $countStmt->fetchColumn();
-$totalPages = ceil($total / $pageSize);
+$total = (int)$countStmt->fetchColumn();
+$totalPages = (int)ceil($total / $pageSize);
+
+// 页码超出有效范围（如筛选、审核、删除后总页数变小）时，回到最后一页，保证页码、列表与总数一致
+if ($totalPages > 0 && $page > $totalPages) {
+    $query = array_filter([
+        'status' => $status,
+        'type' => $type,
+        'keyword' => $keyword,
+        'page' => $totalPages,
+    ], function ($v) { return $v !== ''; });
+    header('Location: index.php?' . http_build_query($query));
+    exit;
+}
+if ($page > 1 && $totalPages === 0) {
+    $page = 1;
+}
+$offset = ($page - 1) * $pageSize;
 
 $sql = "SELECT * FROM messages $where ORDER BY created_at DESC LIMIT $pageSize OFFSET $offset";
 $stmt = $db->prepare($sql);
@@ -113,7 +130,7 @@ include __DIR__ . '/header.php';
                 </thead>
                 <tbody>
                     <?php if (empty($messages)): ?>
-                    <tr><td colspan="8" class="text-center">暂无数据</td></tr>
+                    <tr><td colspan="8" class="text-center"><?= $hasFilter ? '未找到符合条件的留言，请调整筛选条件后重试' : '暂无数据' ?></td></tr>
                     <?php else: ?>
                     <?php foreach ($messages as $msg): ?>
                     <tr>
@@ -142,8 +159,8 @@ include __DIR__ . '/header.php';
         </div>
 
         <!-- 分页 -->
-        <?php if ($totalPages > 1): ?>
         <div class="pagination">
+            <?php if ($totalPages > 1): ?>
             <?php if ($page > 1): ?>
             <a href="index.php?page=<?= $page - 1 ?>&status=<?= $status ?>&type=<?= $type ?>&keyword=<?= urlencode($keyword) ?>" class="page-btn">上一页</a>
             <?php endif; ?>
@@ -153,9 +170,9 @@ include __DIR__ . '/header.php';
             <?php if ($page < $totalPages): ?>
             <a href="index.php?page=<?= $page + 1 ?>&status=<?= $status ?>&type=<?= $type ?>&keyword=<?= urlencode($keyword) ?>" class="page-btn">下一页</a>
             <?php endif; ?>
+            <?php endif; ?>
             <span class="page-info">共 <?= $total ?> 条</span>
         </div>
-        <?php endif; ?>
     </div>
 </div>
 

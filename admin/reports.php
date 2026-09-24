@@ -15,7 +15,6 @@ $reportType = $_GET['report_type'] ?? '';
 $keyword = trim($_GET['keyword'] ?? '');
 $page = max(1, intval($_GET['page'] ?? 1));
 $pageSize = 15;
-$offset = ($page - 1) * $pageSize;
 
 $where = "WHERE 1=1";
 $params = [];
@@ -28,18 +27,36 @@ if ($reportType && in_array($reportType, ['spam', 'abuse', 'illegal', 'porn', 'o
     $where .= " AND r.report_type = ?";
     $params[] = $reportType;
 }
-if ($keyword) {
+if ($keyword !== '') {
+    // 转义 %、_ 等特殊字符，按普通文本匹配
     $where .= " AND (m.title LIKE ? OR m.content LIKE ? OR r.description LIKE ?)";
-    $kw = "%$keyword%";
+    $kw = '%' . escapeLike($keyword) . '%';
     $params[] = $kw;
     $params[] = $kw;
     $params[] = $kw;
 }
+$hasFilter = !empty($params);
 
 $countStmt = $db->prepare("SELECT COUNT(*) FROM reports r LEFT JOIN messages m ON r.message_id = m.id $where");
 $countStmt->execute($params);
-$total = $countStmt->fetchColumn();
-$totalPages = ceil($total / $pageSize);
+$total = (int)$countStmt->fetchColumn();
+$totalPages = (int)ceil($total / $pageSize);
+
+// 页码超出有效范围（如筛选、处理后总页数变小）时，回到最后一页，保证页码、列表与总数一致
+if ($totalPages > 0 && $page > $totalPages) {
+    $query = array_filter([
+        'status' => $status,
+        'report_type' => $reportType,
+        'keyword' => $keyword,
+        'page' => $totalPages,
+    ], function ($v) { return $v !== ''; });
+    header('Location: reports.php?' . http_build_query($query));
+    exit;
+}
+if ($page > 1 && $totalPages === 0) {
+    $page = 1;
+}
+$offset = ($page - 1) * $pageSize;
 
 $sql = "SELECT r.*, m.title as message_title, m.nickname as message_nickname, m.type as message_type, a.username as admin_name 
         FROM reports r 
@@ -139,7 +156,7 @@ include __DIR__ . '/header.php';
                 </thead>
                 <tbody>
                     <?php if (empty($reports)): ?>
-                    <tr><td colspan="8" class="text-center">暂无数据</td></tr>
+                    <tr><td colspan="8" class="text-center"><?= $hasFilter ? '未找到符合条件的举报，请调整筛选条件后重试' : '暂无数据' ?></td></tr>
                     <?php else: ?>
                     <?php foreach ($reports as $r): ?>
                     <tr>
@@ -171,8 +188,8 @@ include __DIR__ . '/header.php';
             </table>
         </div>
 
-        <?php if ($totalPages > 1): ?>
         <div class="pagination">
+            <?php if ($totalPages > 1): ?>
             <?php if ($page > 1): ?>
             <a href="reports.php?page=<?= $page - 1 ?>&status=<?= $status ?>&report_type=<?= $reportType ?>&keyword=<?= urlencode($keyword) ?>" class="page-btn">上一页</a>
             <?php endif; ?>
@@ -182,9 +199,9 @@ include __DIR__ . '/header.php';
             <?php if ($page < $totalPages): ?>
             <a href="reports.php?page=<?= $page + 1 ?>&status=<?= $status ?>&report_type=<?= $reportType ?>&keyword=<?= urlencode($keyword) ?>" class="page-btn">下一页</a>
             <?php endif; ?>
+            <?php endif; ?>
             <span class="page-info">共 <?= $total ?> 条</span>
         </div>
-        <?php endif; ?>
     </div>
 </div>
 
