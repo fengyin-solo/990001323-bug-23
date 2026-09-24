@@ -10,37 +10,49 @@ $jsPath = '../assets/js/main.js';
 
 $db = getDB();
 
-// 筛选参数
+// 筛选参数（白名单校验，非法值按未选择处理，保证任意翻页链接条件一致）
 $status = $_GET['status'] ?? '';
 $type = $_GET['type'] ?? '';
 $keyword = trim($_GET['keyword'] ?? '');
+if (!in_array($status, ['0', '1', '2'], true)) $status = '';
+if (!in_array($type, ['help', 'suggest', 'lost'], true)) $type = '';
+
+// 列表、总数统计、CSV 导出共用同一筛选条件
+list($where, $params) = buildMessageWhere($status, $type, $keyword);
+
+// 导出当前筛选范围内的全部留言（与列表、总数范围一致）
+if (($_GET['export'] ?? '') === 'csv') {
+    exportMessagesCsv($db, $where, $params);
+}
+
 $page = max(1, intval($_GET['page'] ?? 1));
 $pageSize = 15;
-$offset = ($page - 1) * $pageSize;
-
-$where = "WHERE 1=1";
-$params = [];
-
-if ($status !== '' && in_array($status, ['0', '1', '2'])) {
-    $where .= " AND status = ?";
-    $params[] = intval($status);
-}
-if ($type && in_array($type, ['help', 'suggest', 'lost'])) {
-    $where .= " AND type = ?";
-    $params[] = $type;
-}
-if ($keyword) {
-    $where .= " AND (title LIKE ? OR content LIKE ? OR nickname LIKE ?)";
-    $kw = "%$keyword%";
-    $params[] = $kw;
-    $params[] = $kw;
-    $params[] = $kw;
-}
 
 $countStmt = $db->prepare("SELECT COUNT(*) FROM messages $where");
 $countStmt->execute($params);
-$total = $countStmt->fetchColumn();
-$totalPages = ceil($total / $pageSize);
+$total = (int) $countStmt->fetchColumn();
+$totalPages = (int) ceil($total / $pageSize);
+
+// 页码超出有效范围（如筛选条件改变、删除末页数据）时回到最后一页，
+// 避免表格空白却保留旧总数
+if ($page > $totalPages && $total > 0) {
+    $redirect = array_merge($_GET, ['page' => $totalPages]);
+    unset($redirect['export']);
+    header('Location: index.php?' . http_build_query($redirect));
+    exit;
+}
+if ($total === 0) $page = 1;
+
+$offset = ($page - 1) * $pageSize;
+
+// 统一构造翻页与导出链接，确保携带完全相同的筛选条件
+$baseQuery = ['status' => $status, 'type' => $type, 'keyword' => $keyword];
+$activeQuery = array_filter($baseQuery, fn($v) => $v !== '');
+$pageUrl = function ($p) use ($baseQuery) {
+    return 'index.php?' . http_build_query($baseQuery + ['page' => $p]);
+};
+$exportUrl = 'index.php?' . http_build_query($activeQuery + ['export' => 'csv']);
+$hasActiveFilter = !empty($activeQuery);
 
 $sql = "SELECT * FROM messages $where ORDER BY created_at DESC LIMIT $pageSize OFFSET $offset";
 $stmt = $db->prepare($sql);
@@ -77,22 +89,24 @@ include __DIR__ . '/header.php';
 
         <!-- 筛选栏 -->
         <div class="admin-filter">
-            <form method="GET" class="filter-form">
-                <select name="status">
+            <form method="GET" class="filter-form" id="filterForm">
+                <input type="hidden" name="page" value="1">
+                <select name="status" onchange="document.getElementById('filterForm').submit()">
                     <option value="">全部状态</option>
                     <option value="0" <?= $status === '0' ? 'selected' : '' ?>>待审核</option>
                     <option value="1" <?= $status === '1' ? 'selected' : '' ?>>已通过</option>
                     <option value="2" <?= $status === '2' ? 'selected' : '' ?>>已拒绝</option>
                 </select>
-                <select name="type">
+                <select name="type" onchange="document.getElementById('filterForm').submit()">
                     <option value="">全部类型</option>
                     <option value="help" <?= $type === 'help' ? 'selected' : '' ?>>居民求助</option>
                     <option value="suggest" <?= $type === 'suggest' ? 'selected' : '' ?>>意见建议</option>
                     <option value="lost" <?= $type === 'lost' ? 'selected' : '' ?>>失物招领</option>
                 </select>
-                <input type="text" name="keyword" placeholder="搜索关键词..." value="<?= cleanInput($keyword) ?>">
+                <input type="text" name="keyword" placeholder="搜索关键词（%、_ 按普通字符）..." value="<?= cleanInput($keyword) ?>">
                 <button type="submit" class="btn btn-primary btn-sm">筛选</button>
                 <a href="index.php" class="btn btn-secondary btn-sm">重置</a>
+                <a class="btn btn-secondary btn-sm" href="<?= $exportUrl ?>">导出CSV</a>
             </form>
         </div>
 
@@ -113,7 +127,16 @@ include __DIR__ . '/header.php';
                 </thead>
                 <tbody>
                     <?php if (empty($messages)): ?>
-                    <tr><td colspan="8" class="text-center">暂无数据</td></tr>
+                    <?php if ($total === 0 && $hasActiveFilter): ?>
+                    <tr>
+                        <td colspan="8" class="text-center">
+                            没有符合当前筛选条件的留言<?= $keyword !== '' ? '（关键词："' . cleanInput($keyword) . '"）' : '' ?>，
+                            请调整筛选条件或<a href="index.php">清除筛选</a>后重试
+                        </td>
+                    </tr>
+                    <?php else: ?>
+                    <tr><td colspan="8" class="text-center">暂无留言数据</td></tr>
+                    <?php endif; ?>
                     <?php else: ?>
                     <?php foreach ($messages as $msg): ?>
                     <tr>
@@ -142,20 +165,20 @@ include __DIR__ . '/header.php';
         </div>
 
         <!-- 分页 -->
-        <?php if ($totalPages > 1): ?>
         <div class="pagination">
+            <?php if ($totalPages > 1): ?>
             <?php if ($page > 1): ?>
-            <a href="index.php?page=<?= $page - 1 ?>&status=<?= $status ?>&type=<?= $type ?>&keyword=<?= urlencode($keyword) ?>" class="page-btn">上一页</a>
+            <a href="<?= $pageUrl($page - 1) ?>" class="page-btn">上一页</a>
             <?php endif; ?>
             <?php for ($i = max(1, $page - 2); $i <= min($totalPages, $page + 2); $i++): ?>
-            <a href="index.php?page=<?= $i ?>&status=<?= $status ?>&type=<?= $type ?>&keyword=<?= urlencode($keyword) ?>" class="page-btn <?= $i === $page ? 'active' : '' ?>"><?= $i ?></a>
+            <a href="<?= $pageUrl($i) ?>" class="page-btn <?= $i === $page ? 'active' : '' ?>"><?= $i ?></a>
             <?php endfor; ?>
             <?php if ($page < $totalPages): ?>
-            <a href="index.php?page=<?= $page + 1 ?>&status=<?= $status ?>&type=<?= $type ?>&keyword=<?= urlencode($keyword) ?>" class="page-btn">下一页</a>
+            <a href="<?= $pageUrl($page + 1) ?>" class="page-btn">下一页</a>
             <?php endif; ?>
-            <span class="page-info">共 <?= $total ?> 条</span>
+            <?php endif; ?>
+            <span class="page-info">共 <?= $total ?> 条，第 <?= $page ?>/<?= max(1, $totalPages) ?> 页</span>
         </div>
-        <?php endif; ?>
     </div>
 </div>
 
@@ -171,6 +194,14 @@ include __DIR__ . '/header.php';
 </div>
 
 <script>
+// 操作完成后回到当前筛选条件的第 1 页，避免停留在已失效的旧页码
+function reloadWithFilters() {
+    const params = new URLSearchParams(window.location.search);
+    params.delete('page');
+    const qs = params.toString();
+    location.href = 'index.php' + (qs ? '?' + qs : '');
+}
+
 function auditMessage(id, status) {
     const action = status === 1 ? '通过' : '拒绝';
     if (!confirm('确定要' + action + '这条留言吗？')) return;
@@ -183,7 +214,7 @@ function auditMessage(id, status) {
     .then(data => {
         if (data.code === 0) {
             alert('操作成功');
-            location.reload();
+            reloadWithFilters();
         } else {
             alert(data.msg);
         }
@@ -201,7 +232,7 @@ function deleteMessage(id) {
     .then(data => {
         if (data.code === 0) {
             alert('删除成功');
-            location.reload();
+            reloadWithFilters();
         } else {
             alert(data.msg);
         }

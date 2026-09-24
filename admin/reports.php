@@ -10,43 +10,55 @@ $jsPath = '../assets/js/main.js';
 
 $db = getDB();
 
+// 筛选参数（白名单校验，非法值按未选择处理）
 $status = $_GET['status'] ?? '';
 $reportType = $_GET['report_type'] ?? '';
 $keyword = trim($_GET['keyword'] ?? '');
+if (!in_array($status, ['0', '1', '2', '3'], true)) $status = '';
+if (!in_array($reportType, ['spam', 'abuse', 'illegal', 'porn', 'other'], true)) $reportType = '';
+
+// 列表、总数统计、CSV 导出共用同一筛选条件
+list($where, $params) = buildReportWhere($status, $reportType, $keyword);
+
+// 导出当前筛选范围内的全部举报（与列表、总数范围一致）
+if (($_GET['export'] ?? '') === 'csv') {
+    exportReportsCsv($db, $where, $params);
+}
+
 $page = max(1, intval($_GET['page'] ?? 1));
 $pageSize = 15;
-$offset = ($page - 1) * $pageSize;
-
-$where = "WHERE 1=1";
-$params = [];
-
-if ($status !== '' && in_array($status, ['0', '1', '2', '3'])) {
-    $where .= " AND r.status = ?";
-    $params[] = intval($status);
-}
-if ($reportType && in_array($reportType, ['spam', 'abuse', 'illegal', 'porn', 'other'])) {
-    $where .= " AND r.report_type = ?";
-    $params[] = $reportType;
-}
-if ($keyword) {
-    $where .= " AND (m.title LIKE ? OR m.content LIKE ? OR r.description LIKE ?)";
-    $kw = "%$keyword%";
-    $params[] = $kw;
-    $params[] = $kw;
-    $params[] = $kw;
-}
 
 $countStmt = $db->prepare("SELECT COUNT(*) FROM reports r LEFT JOIN messages m ON r.message_id = m.id $where");
 $countStmt->execute($params);
-$total = $countStmt->fetchColumn();
-$totalPages = ceil($total / $pageSize);
+$total = (int) $countStmt->fetchColumn();
+$totalPages = (int) ceil($total / $pageSize);
 
-$sql = "SELECT r.*, m.title as message_title, m.nickname as message_nickname, m.type as message_type, a.username as admin_name 
-        FROM reports r 
-        LEFT JOIN messages m ON r.message_id = m.id 
-        LEFT JOIN admins a ON r.processed_by = a.id 
-        $where 
-        ORDER BY r.created_at DESC 
+// 页码超出有效范围时回到最后一页，避免空白表格搭配旧总数
+if ($page > $totalPages && $total > 0) {
+    $redirect = array_merge($_GET, ['page' => $totalPages]);
+    unset($redirect['export']);
+    header('Location: reports.php?' . http_build_query($redirect));
+    exit;
+}
+if ($total === 0) $page = 1;
+
+$offset = ($page - 1) * $pageSize;
+
+// 统一构造翻页与导出链接，确保携带完全相同的筛选条件
+$baseQuery = ['status' => $status, 'report_type' => $reportType, 'keyword' => $keyword];
+$activeQuery = array_filter($baseQuery, fn($v) => $v !== '');
+$pageUrl = function ($p) use ($baseQuery) {
+    return 'reports.php?' . http_build_query($baseQuery + ['page' => $p]);
+};
+$exportUrl = 'reports.php?' . http_build_query($activeQuery + ['export' => 'csv']);
+$hasActiveFilter = !empty($activeQuery);
+
+$sql = "SELECT r.*, m.title as message_title, m.nickname as message_nickname, m.type as message_type, a.username as admin_name
+        FROM reports r
+        LEFT JOIN messages m ON r.message_id = m.id
+        LEFT JOIN admins a ON r.processed_by = a.id
+        $where
+        ORDER BY r.created_at DESC
         LIMIT $pageSize OFFSET $offset";
 $stmt = $db->prepare($sql);
 $stmt->execute($params);
@@ -101,15 +113,16 @@ include __DIR__ . '/header.php';
         </div>
 
         <div class="admin-filter">
-            <form method="GET" class="filter-form">
-                <select name="status">
+            <form method="GET" class="filter-form" id="filterForm">
+                <input type="hidden" name="page" value="1">
+                <select name="status" onchange="document.getElementById('filterForm').submit()">
                     <option value="">全部状态</option>
                     <option value="0" <?= $status === '0' ? 'selected' : '' ?>>待处理</option>
                     <option value="1" <?= $status === '1' ? 'selected' : '' ?>>已处理-已删除</option>
                     <option value="2" <?= $status === '2' ? 'selected' : '' ?>>已处理-已忽略</option>
                     <option value="3" <?= $status === '3' ? 'selected' : '' ?>>已驳回</option>
                 </select>
-                <select name="report_type">
+                <select name="report_type" onchange="document.getElementById('filterForm').submit()">
                     <option value="">全部类型</option>
                     <option value="spam" <?= $reportType === 'spam' ? 'selected' : '' ?>>垃圾信息</option>
                     <option value="abuse" <?= $reportType === 'abuse' ? 'selected' : '' ?>>辱骂攻击</option>
@@ -117,9 +130,10 @@ include __DIR__ . '/header.php';
                     <option value="porn" <?= $reportType === 'porn' ? 'selected' : '' ?>>色情低俗</option>
                     <option value="other" <?= $reportType === 'other' ? 'selected' : '' ?>>其他</option>
                 </select>
-                <input type="text" name="keyword" placeholder="搜索关键词..." value="<?= cleanInput($keyword) ?>">
+                <input type="text" name="keyword" placeholder="搜索关键词（%、_ 按普通字符）..." value="<?= cleanInput($keyword) ?>">
                 <button type="submit" class="btn btn-primary btn-sm">筛选</button>
                 <a href="reports.php" class="btn btn-secondary btn-sm">重置</a>
+                <a class="btn btn-secondary btn-sm" href="<?= $exportUrl ?>">导出CSV</a>
             </form>
         </div>
 
@@ -139,7 +153,16 @@ include __DIR__ . '/header.php';
                 </thead>
                 <tbody>
                     <?php if (empty($reports)): ?>
-                    <tr><td colspan="8" class="text-center">暂无数据</td></tr>
+                    <?php if ($total === 0 && $hasActiveFilter): ?>
+                    <tr>
+                        <td colspan="8" class="text-center">
+                            没有符合当前筛选条件的举报<?= $keyword !== '' ? '（关键词："' . cleanInput($keyword) . '"）' : '' ?>，
+                            请调整筛选条件或<a href="reports.php">清除筛选</a>后重试
+                        </td>
+                    </tr>
+                    <?php else: ?>
+                    <tr><td colspan="8" class="text-center">暂无举报数据</td></tr>
+                    <?php endif; ?>
                     <?php else: ?>
                     <?php foreach ($reports as $r): ?>
                     <tr>
@@ -171,20 +194,21 @@ include __DIR__ . '/header.php';
             </table>
         </div>
 
-        <?php if ($totalPages > 1): ?>
+        <?php /* 分页：总数始终展示，与列表、导出范围一致 */ ?>
         <div class="pagination">
+            <?php if ($totalPages > 1): ?>
             <?php if ($page > 1): ?>
-            <a href="reports.php?page=<?= $page - 1 ?>&status=<?= $status ?>&report_type=<?= $reportType ?>&keyword=<?= urlencode($keyword) ?>" class="page-btn">上一页</a>
+            <a href="<?= $pageUrl($page - 1) ?>" class="page-btn">上一页</a>
             <?php endif; ?>
             <?php for ($i = max(1, $page - 2); $i <= min($totalPages, $page + 2); $i++): ?>
-            <a href="reports.php?page=<?= $i ?>&status=<?= $status ?>&report_type=<?= $reportType ?>&keyword=<?= urlencode($keyword) ?>" class="page-btn <?= $i === $page ? 'active' : '' ?>"><?= $i ?></a>
+            <a href="<?= $pageUrl($i) ?>" class="page-btn <?= $i === $page ? 'active' : '' ?>"><?= $i ?></a>
             <?php endfor; ?>
             <?php if ($page < $totalPages): ?>
-            <a href="reports.php?page=<?= $page + 1 ?>&status=<?= $status ?>&report_type=<?= $reportType ?>&keyword=<?= urlencode($keyword) ?>" class="page-btn">下一页</a>
+            <a href="<?= $pageUrl($page + 1) ?>" class="page-btn">下一页</a>
             <?php endif; ?>
-            <span class="page-info">共 <?= $total ?> 条</span>
+            <?php endif; ?>
+            <span class="page-info">共 <?= $total ?> 条，第 <?= $page ?>/<?= max(1, $totalPages) ?> 页</span>
         </div>
-        <?php endif; ?>
     </div>
 </div>
 
@@ -218,6 +242,14 @@ include __DIR__ . '/header.php';
 </div>
 
 <script>
+// 处理完成后回到当前筛选条件的第 1 页，避免停留在已失效的旧页码
+function reloadWithFilters() {
+    const params = new URLSearchParams(window.location.search);
+    params.delete('page');
+    const qs = params.toString();
+    location.href = 'reports.php' + (qs ? '?' + qs : '');
+}
+
 let pendingProcessId = null;
 let pendingProcessStatus = null;
 
@@ -318,7 +350,7 @@ function confirmProcess() {
         if (data.code === 0) {
             alert('操作成功');
             closeProcessNoteModal();
-            location.reload();
+            reloadWithFilters();
         } else {
             alert(data.msg);
         }

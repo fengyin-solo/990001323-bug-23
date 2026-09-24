@@ -78,6 +78,147 @@ function cleanInput($str) {
 }
 
 /**
+ * 转义 LIKE 搜索词中的特殊字符（\、%、_），
+ * 使百分号、下划线按普通文本匹配，需配合 ESCAPE '\\' 使用
+ */
+function escapeLike($value) {
+    return addcslashes($value, '\\%_');
+}
+
+/**
+ * 构造后台留言列表的筛选条件
+ * 列表查询、总数统计、CSV 导出共用此条件，保证翻页、导出范围与总数完全一致
+ * 返回 [WHERE SQL 片段, 绑定参数数组]
+ */
+function buildMessageWhere($status, $type, $keyword) {
+    $where = 'WHERE 1=1';
+    $params = [];
+
+    if ($status !== '') {
+        $where .= ' AND status = ?';
+        $params[] = (int) $status;
+    }
+    if ($type !== '') {
+        $where .= ' AND type = ?';
+        $params[] = $type;
+    }
+    if ($keyword !== '') {
+        $like = '%' . escapeLike($keyword) . '%';
+        $where .= " AND (title LIKE ? ESCAPE '\\\\' OR content LIKE ? ESCAPE '\\\\' OR nickname LIKE ? ESCAPE '\\\\')";
+        array_push($params, $like, $like, $like);
+    }
+
+    return [$where, $params];
+}
+
+/**
+ * 构造后台举报列表的筛选条件（同上，列表/计数/导出共用）
+ */
+function buildReportWhere($status, $reportType, $keyword) {
+    $where = 'WHERE 1=1';
+    $params = [];
+
+    if ($status !== '') {
+        $where .= ' AND r.status = ?';
+        $params[] = (int) $status;
+    }
+    if ($reportType !== '') {
+        $where .= ' AND r.report_type = ?';
+        $params[] = $reportType;
+    }
+    if ($keyword !== '') {
+        $like = '%' . escapeLike($keyword) . '%';
+        $where .= " AND (m.title LIKE ? ESCAPE '\\\\' OR m.content LIKE ? ESCAPE '\\\\' OR r.description LIKE ? ESCAPE '\\\\')";
+        array_push($params, $like, $like, $like);
+    }
+
+    return [$where, $params];
+}
+
+/**
+ * CSV 单元格处理：防止 Excel 将 =、+、-、@ 开头的内容解析为公式
+ */
+function csvCell($value) {
+    $value = (string) $value;
+    if ($value !== '' && in_array($value[0], ['=', '+', '-', '@'], true)) {
+        $value = "'" . $value;
+    }
+    return $value;
+}
+
+/**
+ * 发送 CSV 下载响应头
+ */
+function sendCsvHeaders($filename) {
+    header('Content-Type: text/csv; charset=utf-8');
+    header('Content-Disposition: attachment; filename="' . $filename . '"');
+    header('Cache-Control: no-store, no-cache, must-revalidate');
+}
+
+/**
+ * 导出留言列表为 CSV（与列表、总数使用完全相同的筛选条件）
+ */
+function exportMessagesCsv(PDO $db, $where, array $params) {
+    $sql = "SELECT id, type, title, nickname, phone, status, views, created_at
+            FROM messages $where ORDER BY created_at DESC";
+    $stmt = $db->prepare($sql);
+    $stmt->execute($params);
+
+    sendCsvHeaders('messages_' . date('YmdHis') . '.csv');
+    $out = fopen('php://output', 'w');
+    fwrite($out, "\xEF\xBB\xBF"); // UTF-8 BOM，保证 Excel 正确识别中文
+    fputcsv($out, ['ID', '类型', '标题', '昵称', '联系电话', '状态', '浏览量', '创建时间']);
+    while ($m = $stmt->fetch(PDO::FETCH_ASSOC)) {
+        fputcsv($out, array_map('csvCell', [
+            $m['id'],
+            getTypeLabel($m['type']),
+            $m['title'],
+            $m['nickname'],
+            $m['phone'] ?? '',
+            getStatusLabel((int) $m['status']),
+            $m['views'],
+            $m['created_at'],
+        ]));
+    }
+    fclose($out);
+    exit;
+}
+
+/**
+ * 导出举报列表为 CSV（与列表、总数使用完全相同的筛选条件）
+ */
+function exportReportsCsv(PDO $db, $where, array $params) {
+    $sql = "SELECT r.id, r.report_type, r.message_id, m.title AS message_title,
+                   r.description, r.status, r.created_at, a.username AS admin_name, r.processed_at
+            FROM reports r
+            LEFT JOIN messages m ON r.message_id = m.id
+            LEFT JOIN admins a ON r.processed_by = a.id
+            $where ORDER BY r.created_at DESC";
+    $stmt = $db->prepare($sql);
+    $stmt->execute($params);
+
+    sendCsvHeaders('reports_' . date('YmdHis') . '.csv');
+    $out = fopen('php://output', 'w');
+    fwrite($out, "\xEF\xBB\xBF");
+    fputcsv($out, ['ID', '举报类型', '被举报留言ID', '被举报留言标题', '举报说明', '状态', '举报时间', '处理人', '处理时间']);
+    while ($r = $stmt->fetch(PDO::FETCH_ASSOC)) {
+        fputcsv($out, array_map('csvCell', [
+            $r['id'],
+            getReportTypeLabel($r['report_type']),
+            $r['message_id'],
+            $r['message_title'] ?? '',
+            $r['description'] ?? '',
+            getReportStatusLabel((int) $r['status']),
+            $r['created_at'],
+            $r['admin_name'] ?? '',
+            $r['processed_at'] ?? '',
+        ]));
+    }
+    fclose($out);
+    exit;
+}
+
+/**
  * 获取访客唯一标识
  * 基于session和cookie实现匿名用户标识
  */
